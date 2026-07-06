@@ -35,10 +35,10 @@ print(engine.query_formatted("诗122:1—2；4-5，8，123：2；希伯来书 10
     16 “　神爱世人，甚至将他的独生子赐给他们，叫一切信他的，不至灭亡，反得永生。
 ```
 ### API
-query(ref)	返回结构化 QueryResult 对象  
-query_formatted(ref)	返回特定格式的文本  
-search(keyword)	关键词搜索  
-get_books()	获取全部书卷列表  
+- query(ref)	返回结构化 QueryResult 对象  
+- query_formatted(ref)	返回特定格式的文本  
+- search(keyword)	关键词搜索  
+- get_books()	获取全部书卷列表  
 ### 依赖
-Python 3.8.10+  
-sqlite3（内置）
+- Python 3.8.10+  
+- sqlite3（内置）
