@@ -15,7 +15,7 @@
 ```python
 from bible_engine import BibleEngine
 engine = BibleEngine() 
-print(engine.query_formatted("诗122:1—2；4-5，8，123：2；希伯来书 10:25，27；约3：16"))
+print(engine.query_formatted("诗122:1—2，4-5，8；123：2，希伯来书 10:25，27，约3：16"))
 ```
 ### 示例输出
 ```
