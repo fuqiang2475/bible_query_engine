@@ -348,15 +348,7 @@ class BibleEngine:
         """
         查询单个引用（内部方法）
         
-        支持格式：
-            - 单节：约3:16
-            - 整章：约3
-            - 章范围：约1-3
-            - 节范围：约3:1-5
-            - 章范围+节限制：约1-3:5
-            - 跨章连续：约2:3-3:16
-            - 跨章到章尾：约1:5-3
-            - 多单元：约3:1,3,5 或 约1-3:5, 4:1
+        核心原则：书卷分割只看书名，不受逗号分号影响
         """
         result = QueryResult(
             success=True,
@@ -373,26 +365,8 @@ class BibleEngine:
         
         ref = ref.strip()
         
-        # ========== 第一步：识别书名 ==========
-        book_short = None
-        remaining = ref
-        
-        # 尝试全称匹配
-        for short, full in self.short_to_full.items():
-            if ref.startswith(full):
-                book_short = short
-                remaining = ref[len(full):].strip()
-                break
-        
-        # 尝试简称匹配
-        if not book_short:
-            # 匹配开头的汉字（书名）
-            book_match = re.match(r'^([\u4e00-\u9fa5]+)', ref)
-            if book_match:
-                possible_book = book_match.group(1)
-                if possible_book in self.short_to_sn:
-                    book_short = possible_book
-                    remaining = ref[len(possible_book):].strip()
+        # ========== 第一步：提取书名 ==========
+        book_short, remaining = self._extract_book_from_text(ref)
         
         if not book_short:
             result.success = False
@@ -401,104 +375,220 @@ class BibleEngine:
         
         sn = self.short_to_sn[book_short]
         
-        # ========== 第二步：查找后续书卷，分割 ==========
-        next_book_pos = len(remaining)
+        # ========== 第二步：解析剩余部分 ==========
+        # 收集所有查询单元: (book_short, sn, start_ch, start_vs, end_ch, end_vs)
+        units = []
         
-        # 查找所有可能后续书卷的位置
-        for short in self.all_shorts:
-            pos = remaining.find(short)
-            if pos != -1 and pos < next_book_pos:
-                next_book_pos = pos
+        self._parse_remaining(
+            result, book_short, sn, remaining, 
+            units, current_chapter=None
+        )
         
-        for short, full in self.short_to_full.items():
-            pos = remaining.find(full)
-            if pos != -1 and pos < next_book_pos:
-                next_book_pos = pos
-        
-        current_part = remaining[:next_book_pos].strip()
-        rest_part = remaining[next_book_pos:].strip() if next_book_pos < len(remaining) else ""
-        
-        # ========== 第三步：处理当前书卷 ==========
-        if current_part:
-            # 按逗号/分号分割成多个单元
-            units = re.split(r'[；;，,、]', current_part.strip())
-            
-            for unit in units:
-                unit = unit.strip()
-                if not unit:
-                    continue
-                
-                # 解析单元，得到整体起点和终点
-                bounds = self._parse_bounds(sn, book_short, unit, result)
-                if not bounds:
-                    continue
-                
-                start_ch, start_vs, end_ch, end_vs = bounds
-                
-                # 按章切割成段
-                segments = self._split_range(sn, start_ch, start_vs, end_ch, end_vs)
-                
-                # 查询每一段
-                for ch, vs_start, vs_end in segments:
-                    self._query_single(result, book_short, ch, vs_start, vs_end)
-        
-        # ========== 第四步：处理后续书卷（递归） ==========
-        if rest_part:
-            rest_result = self._query_single_ref(rest_part)
-            result.data.extend(rest_result.data)
-            if not rest_result.success:
-                result.success = False
-                result.errors.extend(rest_result.errors)
-            result.warnings.extend(rest_result.warnings)
+        # ========== 第三步：执行查询 ==========
+        for book, sn, start_ch, start_vs, end_ch, end_vs in units:
+            segments = self._split_range(sn, start_ch, start_vs, end_ch, end_vs)
+            for ch, vs_start, vs_end in segments:
+                self._query_single(result, book, ch, vs_start, vs_end)
         
         if result.errors and not result.data:
             result.success = False
         
         return result
 
-    def _parse_bounds(self, sn: int, book_short: str, unit: str, result: QueryResult):
+
+    def _parse_remaining(self, result: QueryResult, book_short: str, sn: int, 
+                        text: str, units: list, current_chapter: int = None):
         """
-        解析单个单元，返回 (start_ch, start_vs, end_ch, end_vs)
+        解析书名后面的剩余部分
         
-        支持格式：
-            - 3:16       → 单节
-            - 3          → 整章
-            - 1-3        → 章范围
-            - 3:1-5      → 节范围
-            - 1-3:5      → 章范围 + 节限制
-            - 2:3-3:16   → 跨章连续
-            - 1:5-3      → 跨章到章尾
+        按分号分割，每个部分独立处理
         """
-        max_chapter = self.sn_info[sn]['chapters']
+        if not text or not text.strip():
+            return
         
-        # ========== 情况1：没有冒号 ==========
-        if ':' not in unit and '：' not in unit:
-            if '-' in unit or '—' in unit or '–' in unit:
-                # 章范围：1-3
-                parts = re.split(r'[-–—]', unit)
-                start_ch = int(parts[0].strip())
-                end_ch = int(parts[1].strip())
-                if start_ch > end_ch:
-                    start_ch, end_ch = end_ch, start_ch
-                return (start_ch, 1, end_ch, self._get_max_verse(sn, end_ch))
+        text = text.strip()
+        
+        # 按分号分割（保留分隔符用于判断）
+        # 使用正则保留分隔符
+        semicolon_parts = re.split(r'([；;])', text)
+        
+        for part in semicolon_parts:
+            part = part.strip()
+            if not part:
+                continue
+            
+            # 如果是分号本身，跳过（它只是分隔符标记）
+            if part in ['；', ';']:
+                continue
+            
+            # ========== 检查是否以新书名开头 ==========
+            new_book, remaining = self._extract_book_from_text(part)
+            
+            if new_book:
+                # 切换到新书卷
+                new_sn = self.short_to_sn[new_book]
+                # 递归解析剩余部分，重置当前章
+                self._parse_remaining(
+                    result, new_book, new_sn, remaining,
+                    units, current_chapter=None
+                )
+                continue
+            
+            # ========== 没有新书名：解析当前书卷 ==========
+            # 分号后面没有新书名 → 章号递增
+            # 但注意：part 可能包含逗号
+            self._parse_part(
+                result, book_short, sn, part,
+                units, current_chapter, is_semicolon=True
+            )
+
+
+    def _parse_part(self, result: QueryResult, book_short: str, sn: int,
+                text: str, units: list, current_chapter: int = None,
+                is_semicolon: bool = True):
+        """解析一个分号片段（可能包含逗号）"""
+        if not text or not text.strip():
+            return
+        
+        text = text.strip()
+        
+        # 按逗号分割
+        comma_parts = re.split(r'[，,]', text)
+        
+        i = 0
+        while i < len(comma_parts):
+            cp = comma_parts[i].strip()
+            if not cp:
+                i += 1
+                continue
+            
+            # 检查是否以新书名开头
+            new_book, remaining = self._extract_book_from_text(cp)
+            
+            if new_book:
+                # 🔥 关键修复：合并当前及后续所有逗号片段
+                rest_of_text = cp
+                for j in range(i + 1, len(comma_parts)):
+                    rest_of_text += "，" + comma_parts[j]
+                
+                new_sn = self.short_to_sn[new_book]
+                self._parse_remaining(
+                    result, new_book, new_sn, rest_of_text,
+                    units, current_chapter=None
+                )
+                break  # 后面的内容已递归处理，跳出循环
+            
+            # 没有新书名
+            if ':' in cp or '：' in cp:
+                # 有冒号：正常解析
+                bounds = self._parse_bounds(sn, book_short, cp, result)
+                if bounds:
+                    start_ch, start_vs, end_ch, end_vs = bounds
+                    units.append((book_short, sn, start_ch, start_vs, end_ch, end_vs))
+                    current_chapter = end_ch
+                i += 1
+                continue
+            
+            # 没有冒号
+            if i == 0 and current_chapter is None:
+                # 第一个片段且没有当前章：章号
+                if '-' in cp or '—' in cp or '–' in cp:
+                    parts = re.split(r'[-–—]', cp)
+                    start_ch = int(parts[0].strip())
+                    end_ch = int(parts[1].strip())
+                    if start_ch > end_ch:
+                        start_ch, end_ch = end_ch, start_ch
+                    for ch in range(start_ch, end_ch + 1):
+                        max_verse = self._get_max_verse(sn, ch)
+                        units.append((book_short, sn, ch, 1, ch, max_verse))
+                    current_chapter = end_ch
+                else:
+                    ch = int(cp)
+                    max_verse = self._get_max_verse(sn, ch)
+                    units.append((book_short, sn, ch, 1, ch, max_verse))
+                    current_chapter = ch
+                i += 1
+                continue
+            
+            # 后续片段：同章节
+            if current_chapter is None:
+                result.errors.append(f"逗号分隔但当前章号未知: {cp}")
+                i += 1
+                continue
+            
+            if '-' in cp or '—' in cp or '–' in cp:
+                parts = re.split(r'[-–—]', cp)
+                start_vs = int(parts[0].strip())
+                end_vs = int(parts[1].strip())
+                if start_vs > end_vs:
+                    start_vs, end_vs = end_vs, start_vs
+                units.append((
+                    book_short, sn,
+                    current_chapter, start_vs,
+                    current_chapter, end_vs
+                ))
             else:
-                # 整章：3
-                ch = int(unit)
-                return (ch, 1, ch, self._get_max_verse(sn, ch))
+                vs = int(cp)
+                units.append((
+                    book_short, sn,
+                    current_chapter, vs,
+                    current_chapter, vs
+                ))
+            
+            i += 1
+
+
+    def _extract_book_from_text(self, text: str):
+        """
+        从文本开头提取书名
         
-        # ========== 情况2：有冒号 ==========
+        返回: (书卷简称, 剩余部分)
+        
+        示例:
+            "希伯来书 10:25，27" → ("希伯来书", "10:25，27")
+            "约3:16" → ("约", "3:16")
+            "太13:1-9，18-23" → ("太", "13:1-9，18-23")
+            "18-23" → (None, "18-23")
+        """
+        text = text.strip()
+        if not text:
+            return None, text
+        
+        # 先尝试全称
+        for short, full in self.short_to_full.items():
+            if text.startswith(full):
+                remaining = text[len(full):].strip()
+                return short, remaining
+        
+        # 再尝试简称
+        # 按长度从长到短排序，避免 "约翰" 被 "约" 先匹配
+        sorted_shorts = sorted(self.short_to_sn.keys(), key=len, reverse=True)
+        for short in sorted_shorts:
+            if text.startswith(short):
+                remaining = text[len(short):].strip()
+                return short, remaining
+        
+        return None, text
+
+
+    def _parse_bounds(self, sn: int, book_short: str, unit: str, result: QueryResult):
+        """解析单个单元（包含冒号）"""
+        unit = unit.strip()
+        
+        if ':' not in unit and '：' not in unit:
+            result.errors.append(f"缺少冒号: {unit}")
+            return None
+        
         colon_pos = unit.find(':') if ':' in unit else unit.find('：')
         before = unit[:colon_pos].strip()
         after = unit[colon_pos+1:].strip()
         
-        before_is_range = '-' in before or '—' in before or '–' in before
-        after_is_range = '-' in after or '—' in after or '–' in after
+        before_has_range = self._contains_range(before)
+        after_has_range = self._contains_range(after)
         
-        if before_is_range and after_is_range:
-            # 跨章连续：2:5-3:16（但这种格式可能被误判，交给 _parse_bounds_with_dash）
+        if before_has_range and after_has_range:
             return self._parse_bounds_with_dash(sn, book_short, unit, result)
-        
-        elif before_is_range:
+        elif before_has_range:
             # 章范围 + 节限制：1-3:5
             parts = re.split(r'[-–—]', before)
             start_ch = int(parts[0].strip())
@@ -506,8 +596,7 @@ class BibleEngine:
             if start_ch > end_ch:
                 start_ch, end_ch = end_ch, start_ch
             
-            if after_is_range:
-                # 1-3:1-5
+            if after_has_range:
                 after_parts = re.split(r'[-–—]', after)
                 start_vs = int(after_parts[0].strip())
                 end_vs = int(after_parts[1].strip())
@@ -515,21 +604,18 @@ class BibleEngine:
                     start_vs, end_vs = end_vs, start_vs
                 return (start_ch, 1, end_ch, end_vs)
             else:
-                # 1-3:5 → 从章首到第5节
                 end_vs = int(after)
                 return (start_ch, 1, end_ch, end_vs)
-        
         else:
-            # 单章：3:16 或 3:1-5
+            # 单章
             start_ch = int(before)
             end_ch = start_ch
             
-            # 🔥 检测跨章：after 包含冒号（如 2:3-3:16 中 after = "3:16"）
+            # 检测跨章：after 包含冒号
             if ':' in after or '：' in after:
                 return self._parse_bounds_with_dash(sn, book_short, unit, result)
             
-            if after_is_range:
-                # 3:1-5
+            if after_has_range:
                 after_parts = re.split(r'[-–—]', after)
                 start_vs = int(after_parts[0].strip())
                 end_vs = int(after_parts[1].strip())
@@ -537,22 +623,20 @@ class BibleEngine:
                     start_vs, end_vs = end_vs, start_vs
                 return (start_ch, start_vs, end_ch, end_vs)
             else:
-                # 3:16
                 vs = int(after)
                 return (start_ch, vs, end_ch, vs)
-        
-        # 不应该到达这里
-        result.errors.append(f"无法解析: {unit}")
-        return None
-    
+
+
+    def _contains_range(self, text: str) -> bool:
+        """检测文本是否包含范围符号"""
+        if not text:
+            return False
+        return any(ch in text for ch in ['-', '—', '–'])
+
+
     def _parse_bounds_with_dash(self, sn: int, book_short: str, unit: str, result: QueryResult):
         """
-        用 - 分割整个 unit，处理跨章连续
-        
-        支持：
-            - 2:3-3:16
-            - 1:5-3
-            - 1-3:5（但这类格式实际会被 before_is_range 分支捕获）
+        解析跨章连续范围：2:3-3:16
         """
         # 找到第一个 - 的位置
         dash_pos = -1
@@ -569,12 +653,10 @@ class BibleEngine:
         left = unit[:dash_pos].strip()
         right = unit[dash_pos+1:].strip()
         
-        # 解析左半部分（起点）
         left_bounds = self._parse_single_point(sn, book_short, left, result)
         if not left_bounds:
             return None
         
-        # 解析右半部分（终点）
         right_bounds = self._parse_single_point(sn, book_short, right, result)
         if not right_bounds:
             return None
@@ -582,12 +664,12 @@ class BibleEngine:
         start_ch, start_vs = left_bounds
         end_ch, end_vs = right_bounds
         
-        # 验证顺序
         if start_ch > end_ch or (start_ch == end_ch and start_vs > end_vs):
             result.errors.append(f"无效范围（起点 > 终点）: {unit}")
             return None
         
         return (start_ch, start_vs, end_ch, end_vs)
+
 
     def _parse_single_point(self, sn: int, book_short: str, text: str, result: QueryResult):
         """
@@ -596,8 +678,6 @@ class BibleEngine:
         支持：
             - 3:16 → (3, 16)
             - 3 → (3, 1)
-            - 3:1-5 → (3, 1)  # 只取起点
-            - 1-3:5 → (1, 1)  # 只取起点
         """
         text = text.strip()
         
@@ -605,46 +685,20 @@ class BibleEngine:
             colon_pos = text.find(':') if ':' in text else text.find('：')
             before = text[:colon_pos].strip()
             after = text[colon_pos+1:].strip()
-            
-            # before 可能是 "1-3" 或 "3"
-            if '-' in before or '—' in before or '–' in before:
-                parts = re.split(r'[-–—]', before)
-                ch = int(parts[0].strip())
-            else:
-                ch = int(before)
-            
-            # after 可能是 "5" 或 "1-5" 或 "16"
-            if '-' in after or '—' in after or '–' in after:
-                parts = re.split(r'[-–—]', after)
-                vs = int(parts[0].strip())
-            else:
-                vs = int(after)
-            
+            ch = int(before)
+            vs = int(after)
             return (ch, vs)
         else:
-            # 纯数字
-            if '-' in text or '—' in text or '–' in text:
-                parts = re.split(r'[-–—]', text)
-                ch = int(parts[0].strip())
-            else:
-                ch = int(text)
+            ch = int(text)
             return (ch, 1)
 
     def _split_range(self, sn: int, start_ch: int, start_vs: int, end_ch: int, end_vs: int):
         """
         将连续范围按章切割成多个 (ch, vs_start, vs_end) 段
-        
-        示例：
-            整体 (2, 3) → (3, 16)
-            → [(2, 3, max_verse2), (3, 1, 16)]
-            
-            整体 (1, 1) → (3, 5)
-            → [(1, 1, max_verse1), (2, 1, max_verse2), (3, 1, 5)]
         """
         segments = []
         max_chapter = self.sn_info[sn]['chapters']
         
-        # 验证边界
         if start_ch < 1 or start_ch > max_chapter:
             return segments
         if end_ch < 1 or end_ch > max_chapter:
@@ -654,23 +708,18 @@ class BibleEngine:
             max_verse = self._get_max_verse(sn, ch)
             
             if ch == start_ch and ch == end_ch:
-                # 同一章
                 vs_start = start_vs
                 vs_end = end_vs
             elif ch == start_ch:
-                # 起始章：从 start_vs 到章尾
                 vs_start = start_vs
                 vs_end = max_verse
             elif ch == end_ch:
-                # 结束章：从章首到 end_vs
                 vs_start = 1
                 vs_end = end_vs
             else:
-                # 中间章：全章
                 vs_start = 1
                 vs_end = max_verse
             
-            # 边界修正
             if vs_start < 1:
                 vs_start = 1
             if vs_end > max_verse:
@@ -680,7 +729,7 @@ class BibleEngine:
                 segments.append((ch, vs_start, vs_end))
         
         return segments
-
+    
     def _query_single(self, result: QueryResult, book_short: str, chapter: int, start_vs: int, end_vs: int):
         """
         查询单个范围（内部方法）
